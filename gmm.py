@@ -16,7 +16,7 @@ class GMMBase(nn.Module):
         device="cpu",
         n_iter=1000,
         delta=1e-3,
-        warm_start=False
+        warm_start=False,
     ):
         super(GMMBase, self).__init__()
         self.device = device
@@ -27,7 +27,9 @@ class GMMBase(nn.Module):
             raise ValueError("init can be kmeans or random")
         self.init = init
 
-        self.mu = nn.Parameter(torch.Tensor(n_mixtures, n_features), requires_grad=False)
+        self.mu = nn.Parameter(
+            torch.Tensor(n_mixtures, n_features), requires_grad=False
+        )
         self.sigma = None  # To be initialized by subclasses
         self.pi = nn.Parameter(torch.Tensor(n_mixtures), requires_grad=False)
         self.converged_ = False
@@ -151,7 +153,7 @@ class GMMBase(nn.Module):
 
         itr = 0
 
-        while (itr < self.n_iter + 1):
+        while itr < self.n_iter + 1:
 
             has_converged = self.step(x)
 
@@ -172,11 +174,25 @@ class GMMBase(nn.Module):
 class DiagonalCovarianceGMM(GMMBase):
     """Gaussian mixture model with torch operations"""
 
-    def __init__(self, n_mixtures, n_features, init="random", device="cpu", n_iter=1000, delta=1e-3,
-                 warm_start=False):
-        super(DiagonalCovarianceGMM, self).__init__(n_mixtures, n_features, init=init,
-                                                    device=device, n_iter=n_iter, delta=delta,
-                                                    warm_start=warm_start)
+    def __init__(
+        self,
+        n_mixtures,
+        n_features,
+        init="random",
+        device="cpu",
+        n_iter=1000,
+        delta=1e-3,
+        warm_start=False,
+    ):
+        super(DiagonalCovarianceGMM, self).__init__(
+            n_mixtures,
+            n_features,
+            init=init,
+            device=device,
+            n_iter=n_iter,
+            delta=delta,
+            warm_start=warm_start,
+        )
 
         self.sigma = nn.Parameter(
             torch.Tensor(n_mixtures, n_features), requires_grad=False
@@ -217,14 +233,28 @@ class DiagonalCovarianceGMM(GMMBase):
         return sigma
 
 
-
 class FullCovarianceGMM(GMMBase):
     """Gaussian mixture model with torch operations"""
-    def __init__(self, n_mixtures, n_features, init="random", device="cpu", n_iter=1000, delta=1e-3,
-                 warm_start=False):
-        super(FullCovarianceGMM, self).__init__(n_mixtures, n_features, init=init,
-                                                device=device, n_iter=n_iter, delta=delta,
-                                                warm_start=warm_start)
+
+    def __init__(
+        self,
+        n_mixtures,
+        n_features,
+        init="random",
+        device="cpu",
+        n_iter=1000,
+        delta=1e-3,
+        warm_start=False,
+    ):
+        super(FullCovarianceGMM, self).__init__(
+            n_mixtures,
+            n_features,
+            init=init,
+            device=device,
+            n_iter=n_iter,
+            delta=delta,
+            warm_start=warm_start,
+        )
 
         self.sigma = nn.Parameter(
             torch.Tensor(n_mixtures, n_features, n_features), requires_grad=False
@@ -238,11 +268,12 @@ class FullCovarianceGMM(GMMBase):
         self.sigma.data = s
 
     def estimate_precisions(self):
-        identities = (torch
-                      .eye(self.n_features)
-                      .unsqueeze(0)
-                      .repeat(self.n_mixtures, 1, 1)
-                      .to(self.device))
+        identities = (
+            torch.eye(self.n_features)
+            .unsqueeze(0)
+            .repeat(self.n_mixtures, 1, 1)
+            .to(self.device)
+        )
         L = torch.cholesky(self.sigma, upper=False)
         L_inv, _ = torch.triangular_solve(L, identities, upper=False)
 
@@ -259,9 +290,8 @@ class FullCovarianceGMM(GMMBase):
             exp_term[:, k] = torch.sum(y * y, dim=1)
 
         log_det = torch.sum(
-            torch.log(
-                precisions.view(self.n_mixtures, -1)[:, ::self.n_features + 1]
-            ), dim=1
+            torch.log(precisions.view(self.n_mixtures, -1)[:, :: self.n_features + 1]),
+            dim=1,
         )
 
         logp = -0.5 * (self.n_features * math.log(2 * math.pi) + exp_term) + log_det
@@ -282,7 +312,9 @@ class FullCovarianceGMM(GMMBase):
             diff = x - mu[k]
             sigma[k] = torch.mm(responsibilities[:, k] * diff.t(), diff) / nk[k]
             sflat = sigma[k].view(sigma[k].numel())
-            sflat[::n_features + 1] += 1e-6  # Add to diagonal to ensure positive definite
+            sflat[
+                :: n_features + 1
+            ] += 1e-6  # Add to diagonal to ensure positive definite
             sigma[k] = sflat.view(n_features, n_features)
 
         return sigma
@@ -299,19 +331,18 @@ class GMMEmissionModel(nn.Module):
         covariance_type="diagonal",
         n_iter=1000,
         delta=1e-3,
-        warm_start=False
+        warm_start=False,
     ):
         super(GMMEmissionModel, self).__init__()
         gmm_cls = {
             "diag": DiagonalCovarianceGMM,
             "diagonal": DiagonalCovarianceGMM,
-            "full": FullCovarianceGMM
+            "full": FullCovarianceGMM,
         }
 
         if covariance_type not in gmm_cls.keys():
             raise ValueError(
-                "covariance_type can only be one of {}"
-                .format(list(gmm_cls.keys()))
+                "covariance_type can only be one of {}".format(list(gmm_cls.keys()))
             )
 
         self.n_states = n_states
@@ -321,8 +352,13 @@ class GMMEmissionModel(nn.Module):
 
         self.gmms = [
             gmm_cls["covariance_type"](
-                n_mixtures, n_features, init=init, device=device,
-                n_iter=n_iter, delta=delta, warm_start=warm_start
+                n_mixtures,
+                n_features,
+                init=init,
+                device=device,
+                n_iter=n_iter,
+                delta=delta,
+                warm_start=warm_start,
             )
 
             for _ in range(n_states)
@@ -330,23 +366,20 @@ class GMMEmissionModel(nn.Module):
 
     def observation_prob(self, x):
         wlogp = torch.stack([gmm.weighted_log_prob(x) for gmm in self.gmms])
-        assignment_probs = torch.exp(wlogp) # n_states * n_mixtures
+        assignment_probs = torch.exp(wlogp)  # n_states * n_mixtures
 
         return assignment_probs / assignment_probs.sum(1)
 
-    def estimate_new_gammas(self, observation_sequences, obs_gammas):
-        new_gammas = []
+    def estimate_new_gammas(self, x, gammas):
+        probs = self.observation_prob(x).transpose(1, 0, 2)  # N * n_states * n_mixtures
+        new_g = probs / gammas.unsqueeze(0)
 
-        for x, gammas in zip(observation_sequences, obs_gammas):
-            probs = self.observation_prob(x).transpose(1, 0, 2) # N * n_states * n_mixtures
-            new_gammas.append(probs / gammas.unsqueeze(0))
-
-        return new_gammas
+        return new_g
 
     def estimate_pi(self, obs_gammas, new_gammas):
-        sum_pi = torch.zeros(
-            [self.n_states, self.n_mixtures], dtype=torch.float64
-        ).to(self.device)
+        sum_pi = torch.zeros([self.n_states, self.n_mixtures], dtype=torch.float64).to(
+            self.device
+        )
 
         for g, new_g in zip(obs_gammas, new_gammas):
             num = new_g.sum(0)
@@ -358,7 +391,7 @@ class GMMEmissionModel(nn.Module):
 
     def estimate_mu(self, observation_sequences, new_gammas):
         sum_mu = torch.zeros(
-            [self.n_states, self.n_mixtures, self.n_features], dtype=torch.float64 
+            [self.n_states, self.n_mixtures, self.n_features], dtype=torch.float64
         ).to(self.device)
 
         for x, new_g in zip(observation_sequences, new_gammas):
@@ -372,7 +405,38 @@ class GMMEmissionModel(nn.Module):
         return sum_mu
 
     def estimate_sigma(self, observation_sequences, new_gammas, mu):
+        # TODO: implement Sigma update rule
         sum_sigma = torch.zeros(
             [self.n_states, self.n_mixtures, self.n_features, self.n_features],
-            dtype=torch.float64
+            dtype=torch.float64,
         ).to(self.device)
+
+        return sum_sigma
+
+    def m_step(self, x, gammas):
+        new_g = self.estimate_new_gammas(x, gammas)
+
+        return new_g
+
+    def step(self, observation_sequences, obs_gammas):
+        prev_ll = sum([self.log_likelihood(x) for x in observation_sequences])
+
+        new_obs_gammas = []
+
+        for x, gammas in zip(observation_sequences, obs_gammas):
+            new_g = self.m_step(x, gammas)
+            new_obs_gammas.append(new_g)
+
+        pi = self.estimate_pi(obs_gammas, new_obs_gammas)
+        mu = self.estimate_mu(observation_sequences, new_obs_gammas)
+        sigma = self.estimate_sigma(observation_sequences, new_obs_gammas, mu)
+
+        self.update_(mu=mu, sigma=sigma, pi=pi)
+
+        new_ll = sum([self.log_likelihood(x) for x in observation_sequences])
+
+        return self.has_converged(prev_ll, new_ll)
+
+    def update_(self, mu=None, sigma=None, pi=None):
+        # TODO: UPDATE EACH GMM
+        raise NotImplementedError

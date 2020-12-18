@@ -1,0 +1,21 @@
+# GMM - HMM implementation in pytorch
+
+Work in Progress
+
+Features:
+
+- Pytorch implementation of diagonal covariance and full covariance GMMs
+- (WIP) Pytorch implementation of HMM with discrete and continuous (GMM) emissions
+
+
+## Examples
+
+Currently only GMM implementation is complete. Check `gmm_example.py`
+
+
+## Attribution
+
+Parts of the implementations are based on the following repos.
+
+- [gmm-torch](https://github.com/ldeecke/gmm-torch)
+- [HiddenMarkovModel_Pytorch](https://github.com/TreB1eN/HiddenMarkovModel_Pytorch)

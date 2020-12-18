@@ -6,6 +6,15 @@ import torch.optim as optim
 from gmm import DiagonalCovarianceGMM, FullCovarianceGMM
 
 
+def input_to_tensor(inp):
+    if torch.is_tensor(inp):
+        inp = inp.float()
+    else:
+        inp = torch.from_numpy(inp).float()
+
+    return inp
+
+
 class DiscreteEmissionModel(nn.Module):
     def __init__(self, emission_probs, device="cpu"):
         super(DiscreteEmissionModel, self).__init__()
@@ -13,8 +22,15 @@ class DiscreteEmissionModel(nn.Module):
         self.n_observations = emission_probs.shape[0]
         self.n_states = emission_probs.shape[1]
         self.device = device
-        self.probs = nn.Parameter(emission_probs, requires_grad=False)
+        self.probs = nn.Parameter(
+            torch.Tensor(self.n_states, self.n_observations), requires_grad=False
+        )
+        self.reset_parameters(emission_probs)
         self.to(self.device)
+
+    def reset_parameters(self, emission_probs):
+        emission_probs = input_to_tensor(emission_probs)
+        self.probs.data = emission_probs
 
     def log_prob(self, x):
         return torch.log(self.probs[x])
@@ -26,12 +42,10 @@ class DiscreteEmissionModel(nn.Module):
         return self.probs[x]
 
     def estimate_emissions(self, observation_sequences, obs_gammas):
-        sum_marginal = torch.zeros(
-            [self.n_states], dtype=torch.float64
-        ).to(self.device)
+        sum_marginal = torch.zeros([self.n_states], dtype=torch.float).to(self.device)
 
         sum_emission_scores = torch.zeros(
-            [self.n_observations, self.n_states], dtype=torch.float64
+            [self.n_observations, self.n_states], dtype=torch.float
         ).to(self.device)
 
         for x, gammas in zip(observation_sequences, obs_gammas):
@@ -39,16 +53,11 @@ class DiscreteEmissionModel(nn.Module):
 
             # One hot encoding buffer that you create out of the loop and just keep reusing
             seq_one_hot = torch.zeros(
-                [x.size(0), self.n_observations],
-                dtype=torch.float64
+                [x.size(0), self.n_observations], dtype=torch.float
             ).to(self.device)
 
-            seq_one_hot.scatter_(
-                1, torch.tensor(x).unsqueeze(1), 1
-            )
-            emission_scores = torch.matmul(
-                seq_one_hot.transpose_(1, 0), gammas
-            )
+            seq_one_hot.scatter_(1, x.unsqueeze(1), 1)
+            emission_scores = torch.matmul(seq_one_hot.transpose_(1, 0), gammas)
             sum_emission_scores += emission_scores
 
         return sum_emission_scores / sum_marginal
@@ -78,56 +87,67 @@ class DiscreteEmissionModel(nn.Module):
         return self.log_prob(x)
 
 
-class DiagonalGMMEmissionModel(DiagonalCovarianceGMM):
-    pass
-
-
-class FullGMMEmissionModel(FullCovarianceGMM):
-    pass
-
-
 class HMM(nn.Module):
     """Some Information about HMM"""
-    def __init__(self, emission_model, n_states=None, A=None, pi0=None, n_iter=100, device="cpu"):
+
+    def __init__(
+        self, emission_model, n_states=None, A=None, pi0=None, n_iter=100, device="cpu"
+    ):
         super(HMM, self).__init__()
         self.n_iter = n_iter
         self.eps = 1e-6
         self.device = device
 
         if n_states is None and A is None:
-            raise ValueError("You must either pass the number of states or the Transition Matrix")
+            raise ValueError(
+                "You must either pass the number of states or the Transition Matrix"
+            )
 
         if n_states is None:
             n_states = A.shape[0]
+
+        self.n_states = n_states
 
         self.A = nn.Parameter(torch.Tensor(n_states, n_states), requires_grad=False)
         self.pi0 = nn.Parameter(torch.Tensor(n_states), requires_grad=False)
         self.emission_model = emission_model
         self.converged_ = False
 
+        self.reset_parameters(A=A, pi0=pi0)
+
         self.to(self.device)
+
+    def reset_parameters(self, A=None, pi0=None):
+        self.A.normal_()
+        self.pi0.fill_(1.0 / self.n_states)
+
+        if A is not None:
+            A = input_to_tensor(A)
+            self.update_(transition_matrix=A)
+
+        if pi0 is not None:
+            pi0 = input_to_tensor(pi0)
+            self.update_(priors=pi0)
 
     def _forward_alg(self, observation_probs):
         N = observation_probs.size(0)
 
-        alphas = torch.zeros((N, self.n_states)).to(self.device)
+        alphas = torch.zeros((N, self.n_states), dtype=torch.float).to(self.device)
         alphas[0] = self.pi0 * observation_probs[0]
 
-        scale = torch.zeros([N], dtype=torch.float64).to(self.device)
+        scale = torch.zeros([N], dtype=torch.float).to(self.device)
 
         scale[0] = 1.0 / alphas[0].sum()
-        alphas[0] = alphas[0] * scale
+        alphas[0] = alphas[0] * scale[0]
 
         for t in range(1, N):
             # transition prior
-            prior_prob = torch.mm(
-                alphas[t - 1].unsqueeze(0), self.A
-            ).squeeze()
+            prior_prob = torch.mm(alphas[t - 1].unsqueeze(0), self.A).squeeze()
             # forward belief propagation
             alphas[t] = prior_prob * observation_probs[t]
 
             scale[t] = 1.0 / alphas[t].sum()
-            alphas[t] = alphas[t] * scale
+            alphas[t] = alphas[t] * scale[t]
 
         return alphas, scale
 
@@ -137,15 +157,13 @@ class HMM(nn.Module):
         betas = torch.zeros((N, self.n_states)).to(self.device)
 
         # initialize with state ending priors
-        betas[N - 1] = torch.ones(
-            [self.n_states], dtype=torch.float64
-        ) * scale[N - 1]
+        betas[N - 1] = torch.ones([self.n_states], dtype=torch.float) * scale[N - 1]
 
         for t in range(N - 2, -1, -1):
             for i in range(self.n_states):
-                betas[t, i] = (
-                    betas[t + 1] * observation_probs[t + 1]
-                ).dot(self.A[i, :])
+                betas[t, i] = (betas[t + 1] * observation_probs[t + 1]).dot(
+                    self.A[i, :]
+                )
             betas[t] = betas[t] * scale[t]
 
         return betas
@@ -175,7 +193,7 @@ class HMM(nn.Module):
         return ksi
 
     def estimate_priors(self, obs_gammas):
-        sum_priors = torch.zeros([self.nstates], dtype=torch.float64).to(self.device)
+        sum_priors = torch.zeros([self.n_states], dtype=torch.float).to(self.device)
 
         for gammas in obs_gammas:
             sum_priors += gammas[0]
@@ -183,13 +201,11 @@ class HMM(nn.Module):
         return sum_priors / len(obs_gammas)
 
     def estimate_transition_matrix(self, obs_gammas, obs_ksi):
-        sum_ksi = torch.zeros(
-            [self.n_states, self.n_states], dtype=torch.float64
-        ).to(self.device)
+        sum_ksi = torch.zeros([self.n_states, self.n_states], dtype=torch.float).to(
+            self.device
+        )
 
-        sum_gammas = torch.zeros(
-            [self.n_states], dtype=torch.float64
-        ).to(self.device)
+        sum_gammas = torch.zeros([self.n_states], dtype=torch.float).to(self.device)
 
         for gammas, ksi in zip(obs_gammas, obs_ksi):
             sum_ksi += torch.sum(ksi, dim=0)
@@ -198,7 +214,7 @@ class HMM(nn.Module):
         return sum_ksi / sum_gammas
 
     def e_step(self, observation_sequence):
-        observation_probs = self.emission_model.probs(observation_sequence)
+        observation_probs = self.emission_model.prob(observation_sequence)
 
         alphas, betas = self.forward_backward_alg(observation_probs)
 
@@ -262,6 +278,34 @@ class HMM(nn.Module):
         self.baum_welch(observation_sequences)
 
         return self
+
+    def viterbi(self, observation_sequence):
+        N = len(observation_sequence)
+        v_prob = torch.zeros([N, self.n_states], dtype=torch.float).to(self.device)
+
+        backpointer = torch.zeros([N, self.n_states], dtype=torch.long).to(self.device)
+
+        obs_prob = self.emission_model.log_prob(observation_sequence)
+        v_prob[0, :] = torch.log(self.pi0) + obs_prob[0, :]
+
+        logA = torch.log(self.A)
+
+        for t in range(1, N):
+            # belief probagation
+            belief = v_prob[t - 1, :].view(-1, 1) + logA
+            best_belief, best_pointer = torch.max(belief, 0)
+            v_prob[t, :] = best_belief + obs_prob[t]
+            backpointer[t, :] = best_pointer
+
+        best_path = torch.zeros([N], dtype=torch.long).to(self.device)
+        best_path[N - 1] = torch.argmax(v_prob[N - 1, :], dim=0)
+
+        for t in range(N - 2, -1, -1):
+            best_path[t] = backpointer[t + 1, best_path[t + 1]]
+
+        v_prob = torch.exp(v_prob)
+
+        return best_path, v_prob
 
     def forward(self, x):
 

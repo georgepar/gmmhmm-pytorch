@@ -366,52 +366,80 @@ class GMMEmissionModel(nn.Module):
 
     def observation_prob(self, x):
         wlogp = torch.stack([gmm.weighted_log_prob(x) for gmm in self.gmms])
-        assignment_probs = torch.exp(wlogp)  # n_states * n_mixtures
+        assignment_probs = (
+            torch.exp(wlogp).transpose(1, 0, 2).contiguous()
+        )  # -> N * n_states * n_mixtures
 
-        return assignment_probs / assignment_probs.sum(1)
+        return assignment_probs / assignment_probs.sum(1).unsqueeze(1)
 
     def estimate_new_gammas(self, x, gammas):
-        probs = self.observation_prob(x).transpose(1, 0, 2)  # N * n_states * n_mixtures
-        new_g = probs / gammas.unsqueeze(0)
+        probs = self.observation_prob(x)  # N * n_states * n_mixtures
+        new_g = probs / gammas.unsqueeze(-1)
 
         return new_g
 
     def estimate_pi(self, obs_gammas, new_gammas):
-        sum_pi = torch.zeros([self.n_states, self.n_mixtures], dtype=torch.float64).to(
-            self.device
-        )
+        sum_nominator = torch.zeros(
+            [self.n_states, self.n_mixtures], dtype=torch.float64
+        ).to(self.device)
+
+        sum_denom = torch.zeros([self.n_states], dtype=torch.float64).to(self.device)
 
         for g, new_g in zip(obs_gammas, new_gammas):
-            num = new_g.sum(0)
-            denom = g.sum(0).unsqueeze(0)
-            pi = num / denom
-            sum_pi += pi
+            sum_nominator += new_g.sum(0)  # sum along N
+            sum_denom += g.sum(0)  # sum along N
 
-        return sum_pi
+        pi = sum_nominator / sum_denom.unsqueeze(-1)
 
-    def estimate_mu(self, observation_sequences, new_gammas):
-        sum_mu = torch.zeros(
+        return pi  # n_states * n_mixtures
+
+    def estimate_mu(self, observation_sequences, new_gammas, marginal):
+        # marginal -> sum_observations(sum_time(new_gammas)) -> (n_states * n_mixtures)
+
+        sum_nominator = torch.zeros(
             [self.n_states, self.n_mixtures, self.n_features], dtype=torch.float64
         ).to(self.device)
 
         for x, new_g in zip(observation_sequences, new_gammas):
             # x -> N * n_features
-            # new_g -> N * n_states * n_mixtures
-            num = torch.matmul(new_g.transpose(1, 2, 0), x)
-            denom = new_g.sum(0)
-            mu = num / denom.unsqueeze(0)
-            sum_mu += mu
+            # new_g: N * n_states * n_mixtures -> n_states * n_mixtures * N
+            num = torch.matmul(new_g.transpose(1, 2, 0).contiguous(), x)
+            sum_nominator += num
 
-        return sum_mu
+        mu = sum_nominator / marginal.unsqueeze(-1)
 
-    def estimate_sigma(self, observation_sequences, new_gammas, mu):
+        return mu
+
+    def estimate_sigma(self, observation_sequences, new_gammas, mu, marginal):
+        # marginal -> sum_observations(sum_time(new_gammas)) -> (n_states * n_mixtures)
+
         # TODO: implement Sigma update rule
-        sum_sigma = torch.zeros(
+        sum_num = torch.zeros(
             [self.n_states, self.n_mixtures, self.n_features, self.n_features],
             dtype=torch.float64,
         ).to(self.device)
 
-        return sum_sigma
+        for x, new_g in zip(observation_sequences, new_gammas):
+            # x -> N * n_features
+            # mu -> n_states * n_mixtures * n_features
+            N = x.size(0)
+            mu_rep = mu.unsqueeze(0).repeat(N, 1, 1, 1)
+            diff = (
+                x.view(N, 1, 1, self.n_features) - mu_rep
+            )  # N * n_states * n_mixtures * n_features
+
+            # Outer product (x - mu) * (x - mu)^T
+            # N * n_states * n_mixtures * n_features * n_features
+            xmu2 = torch.einsum("nsmi,nsmj->nsmij", (diff, diff))
+
+            # new_g: N * n_states * n_mixtures
+            num = new_g.unsqueeze(-1).unsqueeze(-1) * xmu2
+            num = num.sum(0)
+            sum_num += num
+
+        sigma = sum_num / marginal.unsqueeze(-1).unsqueeze(-1)
+
+        return sigma
 
     def m_step(self, x, gammas):
         new_g = self.estimate_new_gammas(x, gammas)
@@ -427,9 +455,13 @@ class GMMEmissionModel(nn.Module):
             new_g = self.m_step(x, gammas)
             new_obs_gammas.append(new_g)
 
+        marginal = torch.zeros(
+            [self.n_states, self.n_mixtures], dtype=torch.float64
+        ).to(self.device)
+
         pi = self.estimate_pi(obs_gammas, new_obs_gammas)
-        mu = self.estimate_mu(observation_sequences, new_obs_gammas)
-        sigma = self.estimate_sigma(observation_sequences, new_obs_gammas, mu)
+        mu = self.estimate_mu(observation_sequences, new_obs_gammas, marginal)
+        sigma = self.estimate_sigma(observation_sequences, new_obs_gammas, mu, marginal)
 
         self.update_(mu=mu, sigma=sigma, pi=pi)
 
@@ -438,5 +470,15 @@ class GMMEmissionModel(nn.Module):
         return self.has_converged(prev_ll, new_ll)
 
     def update_(self, mu=None, sigma=None, pi=None):
-        # TODO: UPDATE EACH GMM
-        raise NotImplementedError
+        """
+        mu: (n_states, n_mixtures, n_features)
+        pi: (n_states, n_mixtures)
+        sigma: (n_states, n_mixtures, n_features, n_features)
+        """
+
+        for state in range(self.n_states):
+            if self.covariance_type in ["diag", "diagonal"]:
+                s = torch.diag(sigma[state])
+            else:
+                s = sigma[state]
+            self.gmms[state].update_(mu=mu[state], sigma=s, pi=pi[state])

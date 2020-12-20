@@ -344,14 +344,13 @@ class GMMEmissionModel(nn.Module):
             raise ValueError(
                 "covariance_type can only be one of {}".format(list(gmm_cls.keys()))
             )
-
         self.n_states = n_states
         self.n_mixtures = n_mixtures
         self.n_features = n_features
         self.device = device
-
+        self.covariance_type = covariance_type
         self.gmms = [
-            gmm_cls["covariance_type"](
+            gmm_cls[covariance_type](
                 n_mixtures,
                 n_features,
                 init=init,
@@ -364,16 +363,37 @@ class GMMEmissionModel(nn.Module):
             for _ in range(n_states)
         ]
 
-    def observation_prob(self, x):
+    def assignment_prob(self, x):
         wlogp = torch.stack([gmm.weighted_log_prob(x) for gmm in self.gmms])
+
+        if wlogp.ndim == 2:
+            wlogp = wlogp.unsqueeze(1)
         assignment_probs = (
-            torch.exp(wlogp).transpose(1, 0, 2).contiguous()
+            torch.exp(wlogp).permute(1, 0, 2).contiguous()
         )  # -> N * n_states * n_mixtures
 
         return assignment_probs / assignment_probs.sum(1).unsqueeze(1)
 
+    def prob(self, x):
+        wlogp = torch.stack([gmm.weighted_log_prob(x) for gmm in self.gmms])
+
+        if wlogp.ndim == 2:
+            wlogp = wlogp.unsqueeze(1)
+        assignment_probs = (
+            torch.exp(wlogp).permute(1, 0, 2).contiguous()
+        )  # -> N * n_states * n_mixtures
+
+        probs = []
+
+        for s in range(self.n_states):
+            probs.append(assignment_probs[:, s, :].matmul(self.gmms[s].pi))
+
+        probs = torch.stack(probs, -1)
+
+        return probs
+
     def estimate_new_gammas(self, x, gammas):
-        probs = self.observation_prob(x)  # N * n_states * n_mixtures
+        probs = self.assignment_prob(x)  # N * n_states * n_mixtures
         new_g = probs / gammas.unsqueeze(-1)
 
         return new_g
@@ -403,7 +423,7 @@ class GMMEmissionModel(nn.Module):
         for x, new_g in zip(observation_sequences, new_gammas):
             # x -> N * n_features
             # new_g: N * n_states * n_mixtures -> n_states * n_mixtures * N
-            num = torch.matmul(new_g.transpose(1, 2, 0).contiguous(), x)
+            num = torch.matmul(new_g.permute(1, 2, 0).contiguous(), x)
             sum_nominator += num
 
         mu = sum_nominator / marginal.unsqueeze(-1)
@@ -447,7 +467,11 @@ class GMMEmissionModel(nn.Module):
         return new_g
 
     def step(self, observation_sequences, obs_gammas):
-        prev_ll = sum([self.log_likelihood(x) for x in observation_sequences])
+        prev_ll = [
+            sum([gmm.log_likelihood(x) for x in observation_sequences])
+
+            for gmm in self.gmms
+        ]
 
         new_obs_gammas = []
 
@@ -465,9 +489,13 @@ class GMMEmissionModel(nn.Module):
 
         self.update_(mu=mu, sigma=sigma, pi=pi)
 
-        new_ll = sum([self.log_likelihood(x) for x in observation_sequences])
+        converged = True
 
-        return self.has_converged(prev_ll, new_ll)
+        for i, gmm in enumerate(self.gmms):
+            new_ll = sum([gmm.log_likelihood(x) for x in observation_sequences])
+            converged = converged and self.has_converged(prev_ll[i], new_ll)
+
+        return converged
 
     def update_(self, mu=None, sigma=None, pi=None):
         """

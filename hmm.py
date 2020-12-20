@@ -2,101 +2,29 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from tqdm import tqdm
 
-from gmm import DiagonalCovarianceGMM, FullCovarianceGMM
-
-
-def input_to_tensor(inp):
-    if torch.is_tensor(inp):
-        inp = inp.float()
-    else:
-        inp = torch.from_numpy(inp).float()
-
-    return inp
-
-
-class DiscreteEmissionModel(nn.Module):
-    def __init__(self, emission_probs, device="cpu"):
-        super(DiscreteEmissionModel, self).__init__()
-        self.eps = 1e-6
-        self.n_observations = emission_probs.shape[0]
-        self.n_states = emission_probs.shape[1]
-        self.device = device
-        self.probs = nn.Parameter(
-            torch.Tensor(self.n_states, self.n_observations), requires_grad=False
-        )
-        self.reset_parameters(emission_probs)
-        self.to(self.device)
-
-    def reset_parameters(self, emission_probs):
-        emission_probs = input_to_tensor(emission_probs)
-        self.probs.data = emission_probs
-
-    def log_prob(self, x):
-        return torch.log(self.probs[x])
-
-    def prob(self, x):
-        return self.probs[x]
-
-    def e_step(self, x):
-        return self.probs[x]
-
-    def estimate_emissions(self, observation_sequences, obs_gammas):
-        sum_marginal = torch.zeros([self.n_states], dtype=torch.float).to(self.device)
-
-        sum_emission_scores = torch.zeros(
-            [self.n_observations, self.n_states], dtype=torch.float
-        ).to(self.device)
-
-        for x, gammas in zip(observation_sequences, obs_gammas):
-            sum_marginal += gammas.sum(0)
-
-            # One hot encoding buffer that you create out of the loop and just keep reusing
-            seq_one_hot = torch.zeros(
-                [x.size(0), self.n_observations], dtype=torch.float
-            ).to(self.device)
-
-            seq_one_hot.scatter_(1, x.unsqueeze(1), 1)
-            emission_scores = torch.matmul(seq_one_hot.transpose_(1, 0), gammas)
-            sum_emission_scores += emission_scores
-
-        return sum_emission_scores / sum_marginal
-
-    def m_step(self, x, gamma):
-        emissions = self.estimate_emissions(x, gamma)
-
-        return emissions
-
-    def step(self, x, gamma):
-        emissions = self.m_step(x, gamma)
-        converged = self.has_converged(self.probs, emissions)
-        self.update_(probs=emissions)
-
-        return converged
-
-    def has_converged(self, prev_emissions, new_emissions):
-        delta = torch.max(torch.abs(new_emissions - prev_emissions)).item() < self.eps
-
-        return delta < self.eps
-
-    def update_(self, probs=None):
-        if probs is not None:
-            self.probs.data = probs
-
-    def forward(self, x):
-        return self.log_prob(x)
+from util import input_to_tensor
 
 
 class HMM(nn.Module):
     """Some Information about HMM"""
 
     def __init__(
-        self, emission_model, n_states=None, A=None, pi0=None, n_iter=100, device="cpu"
+        self,
+        emission_model,
+        n_states=None,
+        A=None,
+        pi0=None,
+        n_iter=100,
+        dtype=torch.float,
+        device="cpu",
     ):
         super(HMM, self).__init__()
         self.n_iter = n_iter
         self.eps = 1e-6
         self.device = device
+        self.dtype = dtype
 
         if n_states is None and A is None:
             raise ValueError(
@@ -108,8 +36,10 @@ class HMM(nn.Module):
 
         self.n_states = n_states
 
-        self.A = nn.Parameter(torch.Tensor(n_states, n_states), requires_grad=False)
-        self.pi0 = nn.Parameter(torch.Tensor(n_states), requires_grad=False)
+        self.A = nn.Parameter(
+            torch.Tensor(n_states, n_states).type(dtype), requires_grad=False
+        )
+        self.pi0 = nn.Parameter(torch.Tensor(n_states).type(dtype), requires_grad=False)
         self.emission_model = emission_model
         self.converged_ = False
 
@@ -122,20 +52,20 @@ class HMM(nn.Module):
         self.pi0.fill_(1.0 / self.n_states)
 
         if A is not None:
-            A = input_to_tensor(A)
+            A = input_to_tensor(A, dtype=self.dtype)
             self.update_(transition_matrix=A)
 
         if pi0 is not None:
-            pi0 = input_to_tensor(pi0)
+            pi0 = input_to_tensor(pi0, dtype=self.dtype)
             self.update_(priors=pi0)
 
     def _forward_alg(self, observation_probs):
         N = observation_probs.size(0)
 
-        alphas = torch.zeros((N, self.n_states), dtype=torch.float).to(self.device)
+        alphas = torch.zeros((N, self.n_states), dtype=self.dtype).to(self.device)
         alphas[0] = self.pi0 * observation_probs[0]
 
-        scale = torch.zeros([N], dtype=torch.float).to(self.device)
+        scale = torch.zeros([N], dtype=self.dtype).to(self.device)
 
         scale[0] = 1.0 / alphas[0].sum()
         alphas[0] = alphas[0] * scale[0]
@@ -154,10 +84,12 @@ class HMM(nn.Module):
     def _backward_alg(self, observation_probs, scale):
         N = observation_probs.size(0)
 
-        betas = torch.zeros((N, self.n_states)).to(self.device)
+        betas = torch.zeros((N, self.n_states), dtype=self.dtype).to(self.device)
 
         # initialize with state ending priors
-        betas[N - 1] = torch.ones([self.n_states], dtype=torch.float) * scale[N - 1]
+        betas[N - 1] = (
+            torch.ones([self.n_states], dtype=self.dtype).to(self.device) * scale[N - 1]
+        )
 
         for t in range(N - 2, -1, -1):
             for i in range(self.n_states):
@@ -180,20 +112,25 @@ class HMM(nn.Module):
 
         return gammas
 
-    def calculate_ksi(self, betas, gammas, obs_seq):
-        N = gammas.size(0)
-        ksi = torch.zeros([N - 1, self.n_states, self.n_states])
+    def calculate_ksi(self, alphas, betas, obs_seq):
+        N = alphas.size(0)
+        ksi = torch.zeros((N - 1, self.n_states, self.n_states), dtype=self.dtype).to(
+            self.device
+        )
 
         for t in range(N - 1):
+            next_prob = self.emission_model.prob(obs_seq[t + 1].unsqueeze(0))
+            tmp = torch.matmul(alphas[t].unsqueeze(0), self.A) * next_prob.unsqueeze(0)
+            denom = torch.matmul(tmp, betas[t + 1].unsqueeze(1)).squeeze()
+
             for i in range(self.n_states):
-                next_obs = self.emission_model.prob(obs_seq[t + 1])
-                ksi[t, i, :] = gammas[t, i] * self.A[i, :] * next_obs * betas[t + 1]
-                ksi[t, i, :] = ksi[t, i, :] / betas[t, i]
+                num = alphas[t, i] * self.A[i, :] * next_prob * betas[t + 1]
+                ksi[t, i, :] = num / denom
 
         return ksi
 
     def estimate_priors(self, obs_gammas):
-        sum_priors = torch.zeros([self.n_states], dtype=torch.float).to(self.device)
+        sum_priors = torch.zeros([self.n_states], dtype=self.dtype).to(self.device)
 
         for gammas in obs_gammas:
             sum_priors += gammas[0]
@@ -201,17 +138,17 @@ class HMM(nn.Module):
         return sum_priors / len(obs_gammas)
 
     def estimate_transition_matrix(self, obs_gammas, obs_ksi):
-        sum_ksi = torch.zeros([self.n_states, self.n_states], dtype=torch.float).to(
+        sum_ksi = torch.zeros([self.n_states, self.n_states], dtype=self.dtype).to(
             self.device
         )
 
-        sum_gammas = torch.zeros([self.n_states], dtype=torch.float).to(self.device)
+        sum_gammas = torch.zeros([self.n_states], dtype=self.dtype).to(self.device)
 
         for gammas, ksi in zip(obs_gammas, obs_ksi):
             sum_ksi += torch.sum(ksi, dim=0)
             sum_gammas += torch.sum(gammas[:-1], dim=0)
 
-        return sum_ksi / sum_gammas
+        return sum_ksi / sum_gammas.unsqueeze(1)
 
     def e_step(self, observation_sequence):
         observation_probs = self.emission_model.prob(observation_sequence)
@@ -225,12 +162,12 @@ class HMM(nn.Module):
         https://imaging.mrc-cbu.cam.ac.uk/methods/BayesianStuff?action=AttachFile&do=get&target=bilmes-em-algorithm.pdf
         """
         gammas = self.calculate_gammas(alphas, betas)
-        ksi = self.calculate_ksi(betas, gammas, observation_sequence)
+        ksi = self.calculate_ksi(alphas, betas, observation_sequence)
 
         return gammas, ksi
 
     def has_converged(self, prev_parameter, new_parameter):
-        delta = torch.max(torch.abs(new_parameter - prev_parameter)).item() < self.eps
+        delta = torch.max(torch.abs(new_parameter - prev_parameter)).item()
 
         return delta < self.eps
 
@@ -249,6 +186,7 @@ class HMM(nn.Module):
         emissions_converged = self.emission_model.step(
             observation_sequences, obs_gammas
         )
+
         A_converged = self.has_converged(self.A, new_A)
         pi0_converged = self.has_converged(self.pi0, new_pi0)
         converged = emissions_converged and A_converged and pi0_converged
@@ -265,14 +203,21 @@ class HMM(nn.Module):
             self.pi0.data = priors
 
     def baum_welch(self, observation_sequence):
-        for step in range(self.n_iter + 1):
+        current_iteration = 0
+        has_converged = False
+
+        for _ in tqdm(range(self.n_iter), desc="Training HMM...", total=self.n_iter):
             has_converged = self.step(observation_sequence)
+            current_iteration += 1
 
             if has_converged:
-                print("Converged at iteration {}".format(step))
-
                 break
-        self.converged_ = True
+
+        if has_converged:
+            print("Converged at iteration {}".format(current_iteration))
+            self.converged_ = True
+        else:
+            print("Could not converge after {} iterations".format(current_iteration))
 
     def fit(self, observation_sequences):
         self.baum_welch(observation_sequences)
@@ -281,9 +226,9 @@ class HMM(nn.Module):
 
     def viterbi(self, observation_sequence):
         N = len(observation_sequence)
-        v_prob = torch.zeros([N, self.n_states], dtype=torch.float).to(self.device)
+        v_prob = torch.zeros((N, self.n_states), dtype=self.dtype).to(self.device)
 
-        backpointer = torch.zeros([N, self.n_states], dtype=torch.long).to(self.device)
+        backpointer = torch.zeros((N, self.n_states), dtype=torch.long).to(self.device)
 
         obs_prob = self.emission_model.log_prob(observation_sequence)
         v_prob[0, :] = torch.log(self.pi0) + obs_prob[0, :]

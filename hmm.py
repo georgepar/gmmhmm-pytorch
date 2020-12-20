@@ -168,7 +168,7 @@ class HMM(nn.Module):
 
     def has_converged(self, prev_parameter, new_parameter):
         delta = torch.max(torch.abs(new_parameter - prev_parameter)).item()
-
+        print(delta)
         return delta < self.eps
 
     def step(self, observation_sequences):

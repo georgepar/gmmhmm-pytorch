@@ -2,8 +2,8 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.distributions.multivariate_normal import MultivariateNormal
-
-from emission import GaussianEmissionModel
+import random
+from emission import DiagonalGaussianEmissionModel as GaussianEmissionModel
 from hmm import HMM
 
 
@@ -21,9 +21,8 @@ def sample_gaussian(which_state, mu, sigma):
 
 
 def reset_sigma(n_states, n_feats):
-    x = torch.rand(n_states, n_feats, n_feats)
-    s = torch.matmul(x, x.transpose(-1, -2)) + 1e-3
-
+    s = torch.eye(n_feats, n_feats) * random.random()
+    s = s.unsqueeze(0).repeat(n_states, 1, 1)
     return s
 
 
@@ -98,13 +97,13 @@ def train_multi_observation():
     True_sigma = reset_sigma(n_states, n_feats)
     obs_seq = [generate_HMM_observation(
         200, n_feats, True_pi0, True_A, True_mu, True_sigma
-    ).to("cuda") for _ in range(100)]
+    ).to("cpu") for _ in range(100)]
 
-    emission_model = GaussianEmissionModel(n_states, n_feats, device="cuda")
+    emission_model = GaussianEmissionModel(n_states, n_feats, device="cpu")
     model = HMM(
         emission_model,
         n_states=n_states,
-        device="cuda",
+        device="cpu",
         n_iter=1000,
         dtype=torch.float,
     ).fit(obs_seq)
@@ -141,6 +140,6 @@ def train_multi_observation():
 
 
 if __name__ == "__main__":
-    # train_single_observation()
+    #train_single_observation()
     print("=" * 60)
     train_multi_observation()

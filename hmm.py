@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
 
-from util import input_to_tensor
+from util import input_to_tensor, is_close
 
 
 class HMM(nn.Module):
@@ -167,9 +167,7 @@ class HMM(nn.Module):
         return gammas, ksi
 
     def has_converged(self, prev_parameter, new_parameter):
-        delta = torch.max(torch.abs(new_parameter - prev_parameter)).item()
-        print(delta)
-        return delta < self.eps
+        return is_close(prev_parameter, new_parameter, eps=self.eps)
 
     def step(self, observation_sequences):
         obs_gammas, obs_ksi = [], []

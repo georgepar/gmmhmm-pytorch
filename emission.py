@@ -2,14 +2,16 @@ import math
 
 import torch
 import torch.nn as nn
+from sklearn.cluster import KMeans
 
+from gmm import DiagonalCovarianceGMM, FullCovarianceGMM
 from util import input_to_tensor, is_close
 
 
 class DiscreteEmissionModel(nn.Module):
     def __init__(self, emission_probs, dtype=torch.float, device="cpu"):
         super(DiscreteEmissionModel, self).__init__()
-        self.eps = 1e-6
+        self.eps = 1e-3
         self.dtype = dtype
         self.n_observations = emission_probs.shape[0]
         self.n_states = emission_probs.shape[1]
@@ -24,6 +26,11 @@ class DiscreteEmissionModel(nn.Module):
     def reset_parameters(self, emission_probs):
         emission_probs = input_to_tensor(emission_probs, dtype=self.dtype)
         self.probs.data = emission_probs
+
+    def prefit(self, x):
+        # No real need to prefit this for now.
+
+        return self
 
     def log_prob(self, x):
         return torch.log(self.probs[x])
@@ -80,7 +87,7 @@ class FullGaussianEmissionModel(nn.Module):
         self, n_states, n_feats, mu=None, sigma=None, dtype=torch.float, device="cpu"
     ):
         super(FullGaussianEmissionModel, self).__init__()
-        self.eps = 1e-6
+        self.eps = 1e-3
         self.dtype = dtype
         self.n_feats = n_feats
         self.n_states = n_states
@@ -109,6 +116,37 @@ class FullGaussianEmissionModel(nn.Module):
             x = torch.rand(*self.sigma.shape)
             s = torch.matmul(x, x.transpose(-1, -2)) + 1e-3
             self.sigma.data = s
+
+    def estimate_sequence_states(self, x):
+        all_sequence_items = torch.cat(x)
+        kmu = KMeans(n_clusters=self.n_states, n_init=5).fit(all_sequence_items)
+        assigned_states = kmu.predict(all_sequence_items)
+
+        return all_sequence_items, assigned_states
+
+    def fit_initial_state_distributions(self, all_sequence_items, assigned_states):
+        for s in range(self.n_states):
+            assigned_items = all_sequence_items[assigned_states == s]
+            mu_mle = torch.mean(assigned_items, dim=0)
+            self.mu[s, :] = mu_mle
+            diff = assigned_items - self.mu[s, :].unsqueeze(0)  # N * f
+            self.sigma[s, :, :] = (
+                1.0 / (assigned_items.size(0) - 1) * torch.matmul(diff.t(), diff)
+            )
+
+        return self
+
+    def prefit(self, x):
+        """
+        x: list of sequences as torch.tensors (seq_length, n_features)
+        """
+        all_sequence_items, assigned_states = self.estimate_sequence_states(x)
+        self = self.fit_initial_state_distributions(all_sequence_items, assigned_states)
+        print("Prefited:")
+        print(self.mu)
+        print(self.sigma)
+
+        return self
 
     def log_prob(self, x):
         """
@@ -171,6 +209,8 @@ class FullGaussianEmissionModel(nn.Module):
             sum_sigma += outer
 
         sigma = sum_sigma / marginal.unsqueeze(-1).unsqueeze(-1)
+        reg = 1e-3 * torch.eye(self.n_feats, dtype=self.dtype).to(self.device)
+        sigma += reg.unsqueeze(0)
 
         return sigma
 
@@ -187,6 +227,16 @@ class FullGaussianEmissionModel(nn.Module):
 
     def step(self, xs, gammas):
         mu, sigma = self.m_step(xs, gammas)
+
+        print("*" * 60)
+        print("New mu: ")
+        print(mu)
+        print()
+        print("*" * 60)
+        print("New sigma: ")
+        print(sigma)
+        print()
+
         converged_mu = self.has_converged(self.mu, mu)
         converged_sigma = self.has_converged(self.sigma, sigma)
         self.update_(mu=mu, sigma=sigma)
@@ -240,6 +290,32 @@ class DiagonalGaussianEmissionModel(nn.Module):
         else:
             self.sigma.fill_(1)
 
+    def estimate_sequence_states(self, x):
+        all_sequence_items = torch.cat(x)
+        kmu = KMeans(n_clusters=self.n_states, n_init=5).fit(all_sequence_items)
+        assigned_states = kmu.predict(all_sequence_items)
+
+        return all_sequence_items, assigned_states
+
+    def fit_initial_state_distributions(self, all_sequence_items, assigned_states):
+        for s in range(self.n_states):
+            assigned_items = all_sequence_items[assigned_states == s]
+            mu_mle = torch.mean(assigned_items, dim=0)
+            var_mle = torch.var(assigned_items, dim=0)
+            self.mu[s, :] = mu_mle
+            self.sigma[s, :] = var_mle
+
+        return self
+
+    def prefit(self, x):
+        """
+        x: list of sequences as torch.tensors (seq_length, n_features)
+        """
+        all_sequence_items, assigned_states = self.estimate_sequence_states(x)
+        self = self.fit_initial_state_distributions(all_sequence_items, assigned_states)
+
+        return self
+
     def log_prob(self, x):
         """
         x: N x n_features
@@ -261,11 +337,6 @@ class DiagonalGaussianEmissionModel(nn.Module):
         log_det = torch.sum(torch.log(precisions), dim=2, keepdim=True)
 
         logp = -0.5 * (self.n_feats * math.log(2 * math.pi) + exp_term) + log_det
-
-        if not torch.sum(precisions - self.sigma) < 1e-5:
-            import ipdb
-
-            ipdb.set_trace()
 
         return logp.squeeze()  # N x n_states
 
@@ -292,19 +363,14 @@ class DiagonalGaussianEmissionModel(nn.Module):
             self.device
         )
 
-        mu2 = mu * mu  # n_states * n_feats
-
         for x, gamma in zip(observation_sequences, obs_gammas):
             # x -> N x n_feats
             # gamma -> N x n_states
             # mu -> n_states x n_feats
-            xg2 = torch.einsum("ns, nf, nf -> sf", gamma, x, x) / marginal.unsqueeze(-1)
-            xg = torch.einsum("ns, nf -> sf", gamma, x)
-            muxg = mu * xg / marginal.unsqueeze(-1)
-            s = mu2 + xg2 - 2 * muxg
-            sum_sigma += s
+            diff = x.unsqueeze(1) - mu.unsqueeze(0)  # N x s x f
+            sum_sigma += (gamma.unsqueeze(-1) * diff * diff).sum(0)
 
-        sigma = sum_sigma + self.eps
+        sigma = sum_sigma / marginal.unsqueeze(-1)
 
         return sigma
 
@@ -321,6 +387,7 @@ class DiagonalGaussianEmissionModel(nn.Module):
 
     def step(self, xs, gammas):
         mu, sigma = self.m_step(xs, gammas)
+
         converged_mu = self.has_converged(self.mu, mu)
         converged_sigma = self.has_converged(self.sigma, sigma)
         self.update_(mu=mu, sigma=sigma)
@@ -339,3 +406,195 @@ class DiagonalGaussianEmissionModel(nn.Module):
 
     def forward(self, x):
         return self.log_prob(x)
+
+
+class GMMEmissionModel(nn.Module):
+    def __init__(
+        self,
+        n_mixtures,
+        n_features,
+        n_states,
+        init="random",
+        device="cpu",
+        covariance_type="diagonal",
+        n_iter=1000,
+        delta=1e-3,
+        warm_start=False,
+    ):
+        super(GMMEmissionModel, self).__init__()
+        gmm_cls = {
+            "diag": DiagonalCovarianceGMM,
+            "diagonal": DiagonalCovarianceGMM,
+            "full": FullCovarianceGMM,
+        }
+
+        if covariance_type not in gmm_cls.keys():
+            raise ValueError(
+                "covariance_type can only be one of {}".format(list(gmm_cls.keys()))
+            )
+        self.n_states = n_states
+        self.n_mixtures = n_mixtures
+        self.n_features = n_features
+        self.device = device
+        self.covariance_type = covariance_type
+        self.gmms = [
+            gmm_cls[covariance_type](
+                n_mixtures,
+                n_features,
+                init=init,
+                device=device,
+                n_iter=n_iter,
+                delta=delta,
+                warm_start=warm_start,
+            )
+
+            for _ in range(n_states)
+        ]
+
+    def assignment_prob(self, x):
+        wlogp = torch.stack([gmm.weighted_log_prob(x) for gmm in self.gmms])
+
+        if wlogp.ndim == 2:
+            wlogp = wlogp.unsqueeze(1)
+        assignment_probs = (
+            torch.exp(wlogp).permute(1, 0, 2).contiguous()
+        )  # -> N * n_states * n_mixtures
+
+        return assignment_probs / assignment_probs.sum(1).unsqueeze(1)
+
+    def prob(self, x):
+        wlogp = torch.stack([gmm.weighted_log_prob(x) for gmm in self.gmms])
+
+        if wlogp.ndim == 2:
+            wlogp = wlogp.unsqueeze(1)
+        assignment_probs = (
+            torch.exp(wlogp).permute(1, 0, 2).contiguous()
+        )  # -> N * n_states * n_mixtures
+
+        probs = []
+
+        for s in range(self.n_states):
+            probs.append(assignment_probs[:, s, :].matmul(self.gmms[s].pi))
+
+        probs = torch.stack(probs, -1)
+
+        return probs
+
+    def estimate_new_gammas(self, x, gammas):
+        probs = self.assignment_prob(x)  # N * n_states * n_mixtures
+        new_g = probs / gammas.unsqueeze(-1)
+
+        return new_g
+
+    def estimate_pi(self, obs_gammas, new_gammas):
+        sum_nominator = torch.zeros(
+            [self.n_states, self.n_mixtures], dtype=torch.float64
+        ).to(self.device)
+
+        sum_denom = torch.zeros([self.n_states], dtype=torch.float64).to(self.device)
+
+        for g, new_g in zip(obs_gammas, new_gammas):
+            sum_nominator += new_g.sum(0)  # sum along N
+            sum_denom += g.sum(0)  # sum along N
+
+        pi = sum_nominator / sum_denom.unsqueeze(-1)
+
+        return pi  # n_states * n_mixtures
+
+    def estimate_mu(self, observation_sequences, new_gammas, marginal):
+        # marginal -> sum_observations(sum_time(new_gammas)) -> (n_states * n_mixtures)
+
+        sum_nominator = torch.zeros(
+            [self.n_states, self.n_mixtures, self.n_features], dtype=torch.float64
+        ).to(self.device)
+
+        for x, new_g in zip(observation_sequences, new_gammas):
+            # x -> N * n_features
+            # new_g: N * n_states * n_mixtures -> n_states * n_mixtures * N
+            num = torch.matmul(new_g.permute(1, 2, 0).contiguous(), x)
+            sum_nominator += num
+
+        mu = sum_nominator / marginal.unsqueeze(-1)
+
+        return mu
+
+    def estimate_sigma(self, observation_sequences, new_gammas, mu, marginal):
+        # marginal -> sum_observations(sum_time(new_gammas)) -> (n_states * n_mixtures)
+
+        # TODO: implement Sigma update rule
+        sum_num = torch.zeros(
+            [self.n_states, self.n_mixtures, self.n_features, self.n_features],
+            dtype=torch.float64,
+        ).to(self.device)
+
+        for x, new_g in zip(observation_sequences, new_gammas):
+            # x -> N * n_features
+            # mu -> n_states * n_mixtures * n_features
+            N = x.size(0)
+            mu_rep = mu.unsqueeze(0).repeat(N, 1, 1, 1)
+            diff = (
+                x.view(N, 1, 1, self.n_features) - mu_rep
+            )  # N * n_states * n_mixtures * n_features
+
+            # Outer product (x - mu) * (x - mu)^T
+            # N * n_states * n_mixtures * n_features * n_features
+            xmu2 = torch.einsum("nsmi,nsmj->nsmij", (diff, diff))
+
+            # new_g: N * n_states * n_mixtures
+            num = new_g.unsqueeze(-1).unsqueeze(-1) * xmu2
+            num = num.sum(0)
+            sum_num += num
+
+        sigma = sum_num / marginal.unsqueeze(-1).unsqueeze(-1)
+
+        return sigma
+
+    def m_step(self, x, gammas):
+        new_g = self.estimate_new_gammas(x, gammas)
+
+        return new_g
+
+    def step(self, observation_sequences, obs_gammas):
+        prev_ll = [
+            sum([gmm.log_likelihood(x) for x in observation_sequences])
+
+            for gmm in self.gmms
+        ]
+
+        new_obs_gammas = []
+
+        for x, gammas in zip(observation_sequences, obs_gammas):
+            new_g = self.m_step(x, gammas)
+            new_obs_gammas.append(new_g)
+
+        marginal = torch.zeros(
+            [self.n_states, self.n_mixtures], dtype=torch.float64
+        ).to(self.device)
+
+        pi = self.estimate_pi(obs_gammas, new_obs_gammas)
+        mu = self.estimate_mu(observation_sequences, new_obs_gammas, marginal)
+        sigma = self.estimate_sigma(observation_sequences, new_obs_gammas, mu, marginal)
+
+        self.update_(mu=mu, sigma=sigma, pi=pi)
+
+        converged = True
+
+        for i, gmm in enumerate(self.gmms):
+            new_ll = sum([gmm.log_likelihood(x) for x in observation_sequences])
+            converged = converged and self.has_converged(prev_ll[i], new_ll)
+
+        return converged
+
+    def update_(self, mu=None, sigma=None, pi=None):
+        """
+        mu: (n_states, n_mixtures, n_features)
+        pi: (n_states, n_mixtures)
+        sigma: (n_states, n_mixtures, n_features, n_features)
+        """
+
+        for state in range(self.n_states):
+            if self.covariance_type in ["diag", "diagonal"]:
+                s = torch.diag(sigma[state])
+            else:
+                s = sigma[state]
+            self.gmms[state].update_(mu=mu[state], sigma=s, pi=pi[state])

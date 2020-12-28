@@ -48,7 +48,7 @@ class HMM(nn.Module):
         self.to(self.device)
 
     def reset_parameters(self, A=None, pi0=None):
-        self.A.normal_()
+        self.A.fill_(1.0 / self.n_states)
         self.pi0.fill_(1.0 / self.n_states)
 
         if A is not None:
@@ -105,6 +105,9 @@ class HMM(nn.Module):
         betas = self._backward_alg(observation_probs, scale)
 
         return alphas, betas
+
+    def observation_probs(self, alphas, betas):
+        return 1.0 / (1e-6 + torch.einsum("ns, ns -> s", alphas, betas))
 
     def calculate_gammas(self, alphas, betas):
         joint_prob = alphas * betas
@@ -181,6 +184,15 @@ class HMM(nn.Module):
         new_A = self.estimate_transition_matrix(obs_gammas, obs_ksi)
         new_pi0 = self.estimate_priors(obs_gammas)
 
+        print("*" * 60)
+        print("Transition Matrix;")
+        print(new_A)
+        print()
+        print("*" * 60)
+        print("HMM Priors")
+        print(new_pi0)
+        print()
+
         emissions_converged = self.emission_model.step(
             observation_sequences, obs_gammas
         )
@@ -218,6 +230,7 @@ class HMM(nn.Module):
             print("Could not converge after {} iterations".format(current_iteration))
 
     def fit(self, observation_sequences):
+        self.emission_model = self.emission_model.prefit(observation_sequences)
         self.baum_welch(observation_sequences)
 
         return self
